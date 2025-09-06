@@ -1,0 +1,3 @@
+https://huggingface.co/marsena/paddleocr-onnx-models X can't refer in rapidocr
+
+https://huggingface.co/breezedeus/models / OK for rapidocr
