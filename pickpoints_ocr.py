@@ -165,7 +165,7 @@ def main(args):
         for text, score in zip(results.txts, results.scores):
             print(f"{text} (conf: {score:.2f})")
 
-        for box, text in zip(results.boxes, results.txts):
+        for box, text in zip(results.boxes, results.txts): 
             box = np.array(box).astype(int).reshape(-1, 2)
             cv2.polylines(image, [box], isClosed=True, color=(0, 255, 0), thickness=1)
             cv2.putText(image, f'{text} ({score:.2f})', tuple(box[0]-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)

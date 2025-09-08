@@ -31,3 +31,4 @@ tqdm
 regex
 requests
 PyYAML
+onnxruntime-gpu==1.18.0
