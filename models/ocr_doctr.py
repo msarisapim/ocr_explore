@@ -30,24 +30,35 @@ def doctr_recognize_line(crop_bgr):
     out = rec(img_t)
     return out[0][0]  # predicted string
 
-def get_model():
+def get_model(device=None):
     # assume_straight_pages speeds things up if your crops are already upright
     m = ocr_predictor(pretrained=True, assume_straight_pages=True)
-    # Optional (Torch backend only): push to GPU if available
-    try:
-        import torch
-        if torch.cuda.is_available():
-            m = m.to("cuda")
-    except Exception:
-        pass
+    
+    # Use specified device or auto-detect
+    if device:
+        try:
+            m = m.to(device)
+        except Exception:
+            pass
+    else:
+        # Auto-detect fallback
+        try:
+            import torch
+            if torch.cuda.is_available():
+                m = m.to("cuda")
+            elif torch.backends.mps.is_available():
+                m = m.to("mps")
+        except Exception:
+            pass
+    
     m.eval()
     return m
 
-def doctr_read_line(crop_bgr, min_conf=0.1):
+def doctr_read_line(crop_bgr, min_conf=0.1, device=None):
     _, buf = cv2.imencode(".png", crop_bgr)
     doc = DocumentFile.from_images([buf.tobytes()])
     # model = ocr_predictor(pretrained=True)
-    model = get_model()
+    model = get_model(device=device)
     result = model(doc).export()
 
     # Just return all words from this crop (since it's one line)
@@ -62,7 +73,8 @@ def doctr_read_line(crop_bgr, min_conf=0.1):
 
 def doctr_text_lines_from_bgr(
     imgs_bgr: Union[any, List[any]],
-    min_conf: float = 0.0
+    min_conf: float = 0.0,
+    device=None
 ) -> List[List[str]]:
     """
     Input: single BGR image or list of BGR images (OpenCV).
@@ -78,7 +90,7 @@ def doctr_text_lines_from_bgr(
             raise ValueError("Empty image in batch")
         bytes_list.append(_bgr_to_png_bytes(img))
 
-    model = get_model()
+    model = get_model(device=device)
     doc = DocumentFile.from_images(bytes_list)
     pred = model(doc).export()
 
@@ -94,11 +106,11 @@ def doctr_text_lines_from_bgr(
         out.append(page_lines)
     return out
 
-def doctr_first_line(img_bgr, min_conf=0.1):
+def doctr_first_line(img_bgr, min_conf=0.1, device=None):
     _, buf = cv2.imencode(".png", img_bgr)
     doc = DocumentFile.from_images([buf.tobytes()])
     # model = ocr_predictor(pretrained=True)
-    model = get_model()
+    model = get_model(device=device)
     result = model(doc).export()
 
     for page in result["pages"]:
@@ -109,15 +121,14 @@ def doctr_first_line(img_bgr, min_conf=0.1):
                     return " ".join(words)  # only first line
     return ""
 
-    return out
-
 def doctr_text_join(
     img_bgr,
     min_conf: float = 0.0,
-    normalize_spaces: bool = True
+    normalize_spaces: bool = True,
+    device=None
 ) -> str:
     """Single image → one normalized string."""
-    lines = doctr_text_lines_from_bgr(img_bgr, min_conf=min_conf)[0]
+    lines = doctr_text_lines_from_bgr(img_bgr, min_conf=min_conf, device=device)[0]
     text = "\n".join(lines)
     if normalize_spaces:
         text = re.sub(r"[ \t]+", " ", text).strip()

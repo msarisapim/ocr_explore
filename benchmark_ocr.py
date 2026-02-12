@@ -3,13 +3,19 @@
 
 import time
 import argparse
+import re
 import cv2
 import numpy as np
 import math
 import os
 from PIL import Image
 from rapidfuzz import fuzz
+import platform
 import matplotlib.pyplot as plt
+
+# Configure matplotlib for macOS to support CJK/Thai characters
+if platform.system() == "Darwin":
+    plt.rcParams["font.family"] = ["Arial Unicode MS", "sans-serif"]
 
 # Engines
 import easyocr
@@ -18,6 +24,7 @@ from pytesseract import Output
 from paddleocr import PaddleOCR
 from rapidocr import RapidOCR
 from models.ocr_doctr import doctr_text_join, doctr_read_line, doctr_text_lines_from_bgr, doctr_first_line
+import models.ocr_glm
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 import torch
 
@@ -209,37 +216,73 @@ def save_results_figure(original_img, overlay_img, warped_img, results, output_p
 # ---------- OCR Engines ----------
 
 class OCREngines:
-    def __init__(self):
+    def __init__(self, device_override=None):
         print("[INFO] Loading all OCR engines...")
-        self.easy = easyocr.Reader(['th', 'en'])
+        
+        # Determine device
+        if device_override:
+            self.device = device_override
+        else:
+            self.device = "cpu"
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+        
+        print(f"[INFO] Using device: {self.device.upper()}")
+
+        # EasyOCR
+        self.easy = easyocr.Reader(['th', 'en'], gpu=(self.device != "cpu"))
+        
+        # PaddleOCR uses 'device' argument (e.g., 'gpu', 'cpu')
+        # MPS is not supported in PaddleX backend yet, fallback to CPU
+        paddle_device = self.device
+        if self.device == "cuda":
+            paddle_device = "gpu"
+        elif self.device == "mps":
+            print("[WARN] PaddleOCR (PaddleX) does not support MPS, falling back to CPU.")
+            paddle_device = "cpu"
+        
         self.paddle = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
-            cls_model_dir=None,
+            textline_orientation_model_dir=None,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
-            use_textline_orientation=True
+            use_textline_orientation=True,
+            device=paddle_device,
         )
+
+        # Prepare RapidOCR params with relative paths
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        rapid_model_dir = os.path.join(base_dir, "models", "for_rapidocr")
+        
+        rapid_params = {
+            "Det.model_path": os.path.join(rapid_model_dir, "ch_PP-OCRv5_det_server_infer.onnx"),
+            "Det.box_thresh": 0.3,
+            "Det.unclip_ratio": 2.0,
+            "Cls.cls_thresh": 0.5,
+            "Rec.model_path": os.path.join(rapid_model_dir, "ch_PP-OCRv5_server_rec_infer.onnx"),
+            "Global.text_score": 0.5
+        }
+        
         try:
-            self.rapid = RapidOCR(params={
-                "Det.model_path": r"D:\WORK\SmartSense\Projects\Tools!\PaddlePaddle\models\for_rapidocr\ch_PP-OCRv5_det_server_infer.onnx",
-                "Det.box_thresh": 0.3,
-                "Det.unclip_ratio": 2.0,
-                "Cls.cls_thresh": 0.5,
-                "Rec.model_path": r"D:\WORK\SmartSense\Projects\Tools!\PaddlePaddle\models\for_rapidocr\ch_PP-OCRv5_server_rec_infer.onnx",
-                "Rec.char_dict_path": r"D:\WORK\SmartSense\Projects\DSG-MAERSK\DSG\models\PP-OCRv5\rec\ppocr_keys_v1.txt",
-                "Global.text_score": 0.5
-            })
+            self.rapid = RapidOCR(params=rapid_params)
         except Exception as e:
-            print(f"[WARN] RapidOCR init failed on GPU, retrying CPU… ({e})")
+            print(f"[WARN] RapidOCR init failed on GPU/default, retrying CPU… ({e})")
             import onnxruntime as ort
             # force CPU execution provider
-            self.rapid = RapidOCR(params={ ... })
             ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+            self.rapid = RapidOCR(params=rapid_params)
 
         self.doctr = doctr_text_join
+        
+        # TrOCR
         self.trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed", use_fast=False)
-        self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
+        self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed").to(self.device)
+        
+        # GLM-OCR
+        self.glm_model, self.glm_processor = models.ocr_glm.get_glm_model(device=self.device)
         print("[INFO] Engines loaded ✅")
 
     def run_easy(self, img_path, min_score=0.4):
@@ -314,15 +357,23 @@ class OCREngines:
         return {"text": " ".join(texts), "boxes": boxes}
 
     def run_doctr(self, img, min_score=0.1):
-        text = self.doctr(img, min_conf=min_score)
+        text = self.doctr(img, min_conf=min_score, device=self.device)
+        # Join multi-line results into a single line with spaces
+        text = text.replace("\n", " ").strip()
         return {"text": text, "boxes": []}
 
     def run_trocr(self, img_path):
         pil_img = Image.open(img_path).convert("RGB")
-        pixel_values = self.trocr_processor(images=pil_img, return_tensors="pt").pixel_values
+        pixel_values = self.trocr_processor(images=pil_img, return_tensors="pt").pixel_values.to(self.device)
         generated_ids = self.trocr_model.generate(pixel_values, max_length=16, num_beams=4)
         decoded_text = self.trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return {"text": decoded_text.strip(), "boxes": []}
+
+    def run_glm(self, img_path):
+        text = models.ocr_glm.run_glm_ocr(img_path, self.glm_model, self.glm_processor, self.device)
+        # Clean up newlines for single-line output
+        text = text.replace("\n", " ").strip()
+        return {"text": text, "boxes": []}
 
 # ---------- Benchmark ----------
 
@@ -360,7 +411,16 @@ def main(args):
         input_path = args.input
         warped_display = processed_img.copy()
 
-    engines = OCREngines()
+    # Determine device
+    device = None
+    if args.cpu:
+        device = "cpu"
+    elif args.gpu:
+        device = "cuda"
+    elif args.mps:
+        device = "mps"
+    
+    engines = OCREngines(device_override=device)
     img_for_ocr = processed_img.copy()
 
     candidates = {
@@ -370,6 +430,7 @@ def main(args):
         "rapidocr": lambda: engines.run_rapid(img_for_ocr, args.min_score),
         "doctr": lambda: engines.run_doctr(img_for_ocr, args.min_score),
         "trocr": lambda: engines.run_trocr(input_path),
+        "glm-ocr": lambda: engines.run_glm(input_path),
     }
 
     skip_set = {
@@ -397,6 +458,12 @@ def main(args):
             else:
                 text = payload or ""
                 boxes = []
+
+            # Whitelist filtering
+            if args.whitelist:
+                pattern = f"[^{re.escape(args.whitelist)}]"
+                text = re.sub(pattern, "", text)
+
             acc = "-"
             if args.gt:
                 acc = float(fuzz.ratio(args.gt, text))
@@ -442,5 +509,18 @@ if __name__ == "__main__":
         default="",
         help="Comma-separated engine names to skip (choices: easyocr,tesseract,paddleocr,rapidocr,doctr,trocr)",
     )
+    parser.add_argument(
+        "--whitelist",
+        type=str,
+        default=None,
+        help="Characters to allow in output (e.g., '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ')."
+    )
+    
+    # Device flags
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--cpu", action="store_true", help="Force CPU usage")
+    group.add_argument("--gpu", action="store_true", help="Force GPU (CUDA) usage")
+    group.add_argument("--mps", action="store_true", help="Force MPS (Mac) usage")
+
     args = parser.parse_args()
     main(args)
