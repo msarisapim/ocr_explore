@@ -31,4 +31,7 @@ tqdm
 regex
 requests
 PyYAML
-onnxruntime-gpu==1.18.0
+onnxruntime>=1.26  # onnxruntime-gpu>=1.26 on CUDA machines; required by ultralytics OCR
+ultralytics>=8.4.211  # YOLO26-Text + PP-OCRv6 OCR solution
+gradio>=6.0  # ocr_dashboard.py
+huggingface-hub>=1.16,<2  # gradio needs >=1.16, transformers/doctr need <2
