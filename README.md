@@ -4,6 +4,8 @@ Benchmark OCR engines side by side on the same image: what text each one reads, 
 
 > **Research purposes only.** This repository is an exploratory research project for evaluating OCR approaches. It is not a production system, and results on our small test set should not be taken as general claims about any engine. Each engine and model used here keeps its own license (for example, Ultralytics is AGPL-3.0); check those before using them outside research.
 
+![OCR Benchmark dashboard: PaddleOCR and the five YOLO OCR sizes on a TIS label, with results table, accuracy and latency charts, and per-engine detections](docs/dashboard.png)
+
 It has two ways to use it:
 
 - **Dashboard** (`ocr_dashboard.py`): a local web app for single-image comparison, 4-point perspective correction by clicking on the image, and batch runs over a labeled folder.
