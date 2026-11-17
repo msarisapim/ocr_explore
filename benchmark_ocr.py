@@ -1,4 +1,4 @@
-# python benchmark_ocr.py --mode pickpoints --input data/for_OCR/7_29-8-2025_14H-11M.jpg --gt "1200080"
+# python benchmark_ocr.py --mode pickpoints --input data/28012026_2328011.jpg --gt "TIS 50-2565" --whitelist '0123456789TIS.- '
 # python benchmark_ocr.py --mode full --input data/for_OCR/7_29-8-2025_14H-11M_warped.jpg --gt "2900173"
 
 import time
@@ -25,6 +25,7 @@ from paddleocr import PaddleOCR
 from rapidocr import RapidOCR
 from models.ocr_doctr import doctr_text_join, doctr_read_line, doctr_text_lines_from_bgr, doctr_first_line
 import models.ocr_glm
+from ultralytics import solutions as ul_solutions
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 import torch
 
@@ -215,25 +216,67 @@ def save_results_figure(original_img, overlay_img, warped_img, results, output_p
 
 # ---------- OCR Engines ----------
 
-class OCREngines:
-    def __init__(self, device_override=None):
-        print("[INFO] Loading all OCR engines...")
-        
-        # Determine device
-        if device_override:
-            self.device = device_override
-        else:
-            self.device = "cpu"
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-        
-        print(f"[INFO] Using device: {self.device.upper()}")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+YOLO_OCR_DIR = os.path.join(BASE_DIR, "models", "for_yolo_ocr")
+YOLO_OCR_SIZES = ["n", "s", "m", "l", "x"]
 
-        # EasyOCR
+# Benchmark order. Each YOLO26-Text detector size is its own engine (yolo-ocr-n ... yolo-ocr-x).
+ENGINE_NAMES = [
+    "easyocr",
+    "tesseract",
+    "paddleocr",
+    "paddleocr-onnx",
+    "rapidocr",
+    *[f"yolo-ocr-{s}" for s in YOLO_OCR_SIZES],
+    "doctr",
+    "trocr",
+    "glm-ocr",
+]
+
+
+def resolve_device(device_override=None):
+    if device_override:
+        return device_override
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+class OCREngines:
+    """Holds OCR engines. Each engine is loaded on first use (or up front via `preload`)."""
+
+    def __init__(self, device_override=None, preload=None):
+        self.device = resolve_device(device_override)
+        print(f"[INFO] Using device: {self.device.upper()}")
+        self._loaded = set()
+        self.yolo_ocr = {}
+        for name in preload or []:
+            self.load(name)
+
+    # ----- loading -----
+
+    def load(self, name):
+        """Load `name` if it is not loaded yet. Raises ValueError for unknown engines."""
+        if name in self._loaded:
+            return
+        if name not in ENGINE_NAMES:
+            raise ValueError(f"Unknown engine: {name}")
+        print(f"[INFO] Loading {name}...")
+        if name.startswith("yolo-ocr-"):
+            self._load_yolo_ocr(name.rsplit("-", 1)[1])
+        else:
+            getattr(self, "_load_" + name.replace("-", "_"))()
+        self._loaded.add(name)
+
+    def _load_easyocr(self):
         self.easy = easyocr.Reader(['th', 'en'], gpu=(self.device != "cpu"))
-        
+
+    def _load_tesseract(self):
+        pass  # external binary, nothing to load
+
+    def _load_paddleocr(self):
         # PaddleOCR uses 'device' argument (e.g., 'gpu', 'cpu')
         # MPS is not supported in PaddleX backend yet, fallback to CPU
         paddle_device = self.device
@@ -242,7 +285,7 @@ class OCREngines:
         elif self.device == "mps":
             print("[WARN] PaddleOCR (PaddleX) does not support MPS, falling back to CPU.")
             paddle_device = "cpu"
-        
+
         self.paddle = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
@@ -253,10 +296,8 @@ class OCREngines:
             device=paddle_device,
         )
 
-        # Prepare RapidOCR params with relative paths
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        rapid_model_dir = os.path.join(base_dir, "models", "for_rapidocr")
-        
+    def _load_rapidocr(self):
+        rapid_model_dir = os.path.join(BASE_DIR, "models", "for_rapidocr")
         rapid_params = {
             "Det.model_path": os.path.join(rapid_model_dir, "ch_PP-OCRv5_det_server_infer.onnx"),
             "Det.box_thresh": 0.3,
@@ -265,7 +306,6 @@ class OCREngines:
             "Rec.model_path": os.path.join(rapid_model_dir, "ch_PP-OCRv5_server_rec_infer.onnx"),
             "Global.text_score": 0.5
         }
-        
         try:
             self.rapid = RapidOCR(params=rapid_params)
         except Exception as e:
@@ -275,15 +315,54 @@ class OCREngines:
             ort.get_available_providers = lambda: ["CPUExecutionProvider"]
             self.rapid = RapidOCR(params=rapid_params)
 
+    def _load_paddleocr_onnx(self):
+        # Alias for explicit "PaddleOCR ONNX" benchmark method.
+        # This uses PP-OCRv5 ONNX models via ONNXRuntime (same instance as rapidocr).
+        self.load("rapidocr")
+        self.paddle_onnx = self.rapid
+
+    def _load_yolo_ocr(self, size):
+        # Ultralytics YOLO OCR: YOLO26-Text OBB detector + PP-OCRv6 medium recognizer (ONNX Runtime).
+        # Weights live in models/for_yolo_ocr/ (auto-downloaded there on first run if missing).
+        # The recognizer runs on CPU unless CUDA is available; the detector uses self.device.
+        os.makedirs(YOLO_OCR_DIR, exist_ok=True)
+        self.yolo_ocr[size] = ul_solutions.OCR(
+            model=os.path.join(YOLO_OCR_DIR, f"yolo26{size}-text.pt"),
+            recognizer=os.path.join(YOLO_OCR_DIR, "PP-OCRv6_medium_rec"),
+            device=self.device,
+            verbose=False,
+        )
+
+    def _load_doctr(self):
         self.doctr = doctr_text_join
-        
-        # TrOCR
+
+    def _load_trocr(self):
         self.trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed", use_fast=False)
         self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed").to(self.device)
-        
-        # GLM-OCR
+
+    def _load_glm_ocr(self):
         self.glm_model, self.glm_processor = models.ocr_glm.get_glm_model(device=self.device)
-        print("[INFO] Engines loaded ✅")
+        if self.glm_model is None:
+            raise RuntimeError("GLM-OCR model failed to load (see log above)")
+
+    # ----- running -----
+
+    def run(self, name, img, img_path, min_score=0.4, yolo_ocr_resize=0):
+        """Run engine `name`. `img` is a BGR array, `img_path` the same image on disk."""
+        self.load(name)
+        if name.startswith("yolo-ocr-"):
+            return self.run_yolo_ocr(img, name.rsplit("-", 1)[1], min_score, yolo_ocr_resize)
+        dispatch = {
+            "easyocr": lambda: self.run_easy(img_path, min_score),
+            "tesseract": lambda: self.run_tesseract(img, min_score),
+            "paddleocr": lambda: self.run_paddle(img_path, min_score),
+            "paddleocr-onnx": lambda: self.run_paddle_onnx(img, min_score),
+            "rapidocr": lambda: self.run_rapid(img, min_score),
+            "doctr": lambda: self.run_doctr(img, min_score),
+            "trocr": lambda: self.run_trocr(img_path),
+            "glm-ocr": lambda: self.run_glm(img_path),
+        }
+        return dispatch[name]()
 
     def run_easy(self, img_path, min_score=0.4):
         ocr_result = self.easy.readtext(img_path)
@@ -342,8 +421,8 @@ class OCREngines:
                     boxes.append({"points": pts, "text": clean, "score": float(score)})
         return {"text": " ".join(texts), "boxes": boxes}
 
-    def run_rapid(self, img, min_score=0.4):
-        result = self.rapid(img)
+    @staticmethod
+    def _rapid_payload(result, min_score):
         texts = []
         boxes = []
         if result and result.txts and result.scores and result.boxes is not None:
@@ -354,6 +433,36 @@ class OCREngines:
                 texts.append(clean)
                 pts = np.asarray(box, dtype=np.int32).reshape(-1, 2)
                 boxes.append({"points": [(int(x), int(y)) for x, y in pts], "text": clean, "score": float(score)})
+        return {"text": " ".join(texts), "boxes": boxes}
+
+    def run_rapid(self, img, min_score=0.4):
+        return self._rapid_payload(self.rapid(img), min_score)
+
+    def run_paddle_onnx(self, img, min_score=0.4):
+        return self._rapid_payload(self.paddle_onnx(img), min_score)
+
+    def run_yolo_ocr(self, img, size="s", min_score=0.4, resize_long_side=0):
+        # solutions.OCR never upscales, so tiny crops hit the detector at ~64-96 px.
+        # resize_long_side > 0 rescales the image so its longest side equals that value.
+        scale = 1.0
+        if resize_long_side and resize_long_side > 0:
+            scale = resize_long_side / max(img.shape[:2])
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        # result.texts: one dict per word, already sorted by line then left-to-right.
+        # Pass a copy: solutions.OCR draws its annotations onto the input array in place,
+        # which would corrupt the shared image for later engines (and for repeated calls).
+        result = self.yolo_ocr[size](img.copy())
+        texts = []
+        boxes = []
+        for word in result.texts:
+            clean = word["text"].strip()
+            score = float(word["confidence"])
+            if score < min_score or not clean:
+                continue
+            texts.append(clean)
+            # map polygon back to the un-resized image coordinates
+            pts = (np.asarray(word["polygon"], dtype=np.float32).reshape(-1, 2) / scale).round().astype(np.int32)
+            boxes.append({"points": [(int(x), int(y)) for x, y in pts], "text": clean, "score": score})
         return {"text": " ".join(texts), "boxes": boxes}
 
     def run_doctr(self, img, min_score=0.1):
@@ -382,6 +491,55 @@ def benchmark(fn):
     payload = fn()
     end = time.time()
     return payload, end - start
+
+
+def apply_whitelist(text, whitelist):
+    if not whitelist:
+        return text
+    return re.sub(f"[^{re.escape(whitelist)}]", "", text)
+
+
+def score_text(gt, text):
+    """fuzz.ratio accuracy (0-100) against the ground truth, or '-' when there is no ground truth."""
+    if not gt:
+        return "-"
+    return float(fuzz.ratio(gt, text))
+
+
+def run_benchmark(engines, img, img_path, names, min_score=0.4, gt=None, whitelist=None,
+                  yolo_ocr_resize=0, warmup=False, skip=(), log=print):
+    """Run each engine in `names` on one image and return a list of result dicts.
+
+    img: BGR array; img_path: the same image on disk (some engines only take a path).
+    warmup: run each engine once untimed first, so first-call overhead is not counted.
+    """
+    results = []
+    for name in names:
+        if name in skip:
+            log(f"{name:<10} | SKIPPED")
+            results.append({"name": name, "error": "SKIPPED", "time_ms": 0, "text": "", "acc": "-", "boxes": []})
+            continue
+        try:
+            engines.load(name)  # never count model loading in the timing
+            run = lambda: engines.run(name, img.copy(), img_path, min_score, yolo_ocr_resize)
+            if warmup:
+                run()
+            payload, sec = benchmark(run)
+            if isinstance(payload, dict):
+                text = payload.get("text", "")
+                boxes = payload.get("boxes", [])
+            else:
+                text = payload or ""
+                boxes = []
+            text = apply_whitelist(text, whitelist)
+            acc = score_text(gt, text)
+            log(f"{name:<10} | {sec*1000:.1f} ms | text: {text} | acc: {acc}")
+            results.append({"name": name, "time_ms": sec * 1000, "text": text or "", "acc": acc, "boxes": boxes})
+        except Exception as e:
+            log(f"{name:<10} | ERROR: {e}")
+            results.append({"name": name, "error": str(e), "time_ms": 0, "text": "", "acc": "-", "boxes": []})
+    return results
+
 
 def main(args):
     original_img = cv2.imread(args.input)
@@ -419,67 +577,35 @@ def main(args):
         device = "cuda"
     elif args.mps:
         device = "mps"
-    
-    engines = OCREngines(device_override=device)
-    img_for_ocr = processed_img.copy()
 
-    candidates = {
-        "easyocr": lambda: engines.run_easy(input_path, args.min_score),
-        "tesseract": lambda: engines.run_tesseract(img_for_ocr, args.min_score),
-        "paddleocr": lambda: engines.run_paddle(input_path, args.min_score),
-        "rapidocr": lambda: engines.run_rapid(img_for_ocr, args.min_score),
-        "doctr": lambda: engines.run_doctr(img_for_ocr, args.min_score),
-        "trocr": lambda: engines.run_trocr(input_path),
-        "glm-ocr": lambda: engines.run_glm(input_path),
-    }
+    def parse_names(value):
+        return [n.strip().lower() for n in (value.split(",") if value else []) if n.strip()]
 
-    skip_set = {
-        name.strip().lower()
-        for name in (args.skip_engines.split(",") if args.skip_engines else [])
-        if name.strip()
-    }
-    unknown = sorted(skip_set - set(candidates.keys()))
+    # "yolo-ocr" is shorthand for all YOLO sizes
+    def expand(names):
+        out = []
+        for n in names:
+            out.extend([f"yolo-ocr-{s}" for s in YOLO_OCR_SIZES] if n == "yolo-ocr" else [n])
+        return out
+
+    only = expand(parse_names(args.engines))
+    skip_set = set(expand(parse_names(args.skip_engines)))
+    unknown = sorted((set(only) | skip_set) - set(ENGINE_NAMES))
     if unknown:
-        print(f"[ERROR] Unknown engine(s) in --skip_engines: {', '.join(unknown)}")
+        print(f"[ERROR] Unknown engine(s): {', '.join(unknown)}")
         return
+    names = only or ENGINE_NAMES
+
+    print("[INFO] Loading OCR engines...")
+    engines = OCREngines(device_override=device, preload=[n for n in names if n not in skip_set])
+    print("[INFO] Engines loaded ✅")
 
     print("\n====== OCR Benchmark ======")
-    results = []
-    for name, fn in candidates.items():
-        if name in skip_set:
-            print(f"{name:<10} | SKIPPED")
-            results.append({"name": name, "error": "SKIPPED", "time_ms": 0, "text": "", "acc": "-", "boxes": []})
-            continue
-        try:
-            payload, sec = benchmark(fn)
-            if isinstance(payload, dict):
-                text = payload.get("text", "")
-                boxes = payload.get("boxes", [])
-            else:
-                text = payload or ""
-                boxes = []
-
-            # Whitelist filtering
-            if args.whitelist:
-                pattern = f"[^{re.escape(args.whitelist)}]"
-                text = re.sub(pattern, "", text)
-
-            acc = "-"
-            if args.gt:
-                acc = float(fuzz.ratio(args.gt, text))
-            print(f"{name:<10} | {sec*1000:.1f} ms | text: {text} | acc: {acc}")
-            results.append(
-                {
-                    "name": name,
-                    "time_ms": sec * 1000,
-                    "text": text or "",
-                    "acc": acc,
-                    "boxes": boxes,
-                }
-            )
-        except Exception as e:
-            print(f"{name:<10} | ERROR: {e}")
-            results.append({"name": name, "error": str(e), "time_ms": 0, "text": "", "acc": "-", "boxes": []})
+    results = run_benchmark(
+        engines, processed_img, input_path, names,
+        min_score=args.min_score, gt=args.gt, whitelist=args.whitelist,
+        yolo_ocr_resize=args.yolo_ocr_resize, warmup=args.warmup, skip=skip_set,
+    )
 
     input_basename = os.path.splitext(os.path.basename(args.input))[0]
     figure_name = f"ocr_results_{input_basename}.png"
@@ -503,11 +629,29 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, required=True, help="Input image path")
     parser.add_argument("--min_score", type=float, default=0.4, help="Confidence threshold")
     parser.add_argument("--gt", type=str, default=None, help="Ground truth string (optional)")
+    engine_help = f"choices: {','.join(ENGINE_NAMES)}; 'yolo-ocr' = all YOLO sizes"
+    parser.add_argument(
+        "--engines",
+        type=str,
+        default="",
+        help=f"Comma-separated engines to run (default: all). {engine_help}",
+    )
     parser.add_argument(
         "--skip_engines",
         type=str,
         default="",
-        help="Comma-separated engine names to skip (choices: easyocr,tesseract,paddleocr,rapidocr,doctr,trocr)",
+        help=f"Comma-separated engine names to skip ({engine_help})",
+    )
+    parser.add_argument(
+        "--yolo_ocr_resize",
+        type=int,
+        default=0,
+        help="Resize image so its longest side equals this before yolo-ocr (0 = off). ~160 works well for tiny label crops.",
+    )
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+        help="Run each engine once untimed before timing it (removes first-call overhead).",
     )
     parser.add_argument(
         "--whitelist",
@@ -515,7 +659,7 @@ if __name__ == "__main__":
         default=None,
         help="Characters to allow in output (e.g., '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ')."
     )
-    
+
     # Device flags
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--cpu", action="store_true", help="Force CPU usage")
